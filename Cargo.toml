@@ -5,6 +5,8 @@ edition = "2018"
 
 [dependencies]
 cgmath = "0.17.0"
+clap = "2.33.0"
+multiqueue = "0.3.2"
 hound = "3.4.0"
 jack = "0.6.2"
 lazy_static = "1.4.0"

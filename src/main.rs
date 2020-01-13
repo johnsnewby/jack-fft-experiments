@@ -1,13 +1,13 @@
+use clap::{App, Arg};
 use hound;
 #[macro_use]
 extern crate lazy_static;
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
-use std::io;
 use std::io::Write;
 use std::sync::mpsc::*;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use three;
 use twang::Sound;
 
@@ -17,60 +17,74 @@ struct State {
     scene_meshes: Vec<three::Mesh>,
 }
 
-const WINDOW_SIZE: usize = 44000;
-
 lazy_static! {
-    static ref WRITER: Mutex<hound::WavWriter<std::io::BufWriter<std::fs::File>>> = {
-        Mutex::new(
-            hound::WavWriter::create(
-                "test.wav",
-                hound::WavSpec {
-                    channels: 1,
-                    sample_rate: 48000,
-                    bits_per_sample: 32,
-                    sample_format: hound::SampleFormat::Float,
-                },
-            )
-            .unwrap(),
-        )
-    };
+    static ref SAMPLE_COUNT: Mutex<std::sync::atomic::AtomicUsize> =
+        Mutex::new(std::sync::atomic::AtomicUsize::new(0));
 }
 
-fn fft(receiver: Receiver<Vec<f32>>) {
-    let mut samples: Vec<f32> = vec![];
-    while let Ok(newsamples) = receiver.recv() {
-        println!(
-            "samples len: {}, newsamples len: {}",
-            samples.len(),
-            newsamples.len()
-        );
-        samples.extend(newsamples.iter());
-        println!("Samples count: {}", samples.len());
-        if samples.len() >= WINDOW_SIZE {
-            let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-            let mut input: Vec<Complex<f32>> =
-                samples.iter().map(|val| Complex::new(*val, 0f32)).collect();
-            let fft = planner.plan_fft(input.len());
-            let mut output: Vec<Complex<f32>> = Vec::new();
-            output.resize(input.len(), Zero::zero());
-            fft.process(&mut input, &mut output);
-            output.truncate(output.len() / 2);
-            let mut file = std::fs::File::create(format!(
-                "sample.csv",
-                //                std::time::SystemTime::now()
-                //                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                //                    .unwrap()
-                //                    .as_secs()
-            ))
-            .unwrap();
-            for ele in output {
-                file.write(format!("{}\n", power(&ele)).as_bytes()).unwrap();
+const MAX_SAMPLES: usize = 240000; // 5s @ 48k
+
+fn record(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
+    let mut writer = hound::WavWriter::create(
+        "test.wav",
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        },
+    )
+    .unwrap();
+    for samples in receiver {
+        match samples {
+            Some(x) => {
+                for sample in x {
+                    writer.write_sample(sample).unwrap();
+                }
             }
-            panic!("Run once!");
-            samples = vec![];
+            None => break,
         }
     }
-    println!("Exiting");
+    println!("Writing WAV");
+    writer.finalize().unwrap();
+    println!("WAV done");
+}
+
+fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
+    let mut samples: Vec<f32> = vec![];
+    for received in receiver {
+        match received {
+            Some(newsamples) => {
+                println!(
+                    "samples len: {}, newsamples len: {}",
+                    samples.len(),
+                    newsamples.len()
+                );
+                samples.extend(newsamples.iter());
+            }
+            None => break,
+        }
+    }
+    println!("Falling falling");
+    let mut planner: FFTplanner<f32> = FFTplanner::new(false);
+    let mut input: Vec<Complex<f32>> = samples.iter().map(|val| Complex::new(*val, 0f32)).collect();
+    let fft = planner.plan_fft(input.len());
+    let mut output: Vec<Complex<f32>> = Vec::new();
+    output.resize(input.len(), Zero::zero());
+    fft.process(&mut input, &mut output);
+    output.truncate(output.len() / 2);
+    let mut file = std::fs::File::create(format!(
+        "sample.csv",
+        //                std::time::SystemTime::now()
+        //                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        //                    .unwrap()
+        //                    .as_secs()
+    ))
+    .unwrap();
+    for ele in output {
+        file.write(format!("{}\n", power(&ele)).as_bytes()).unwrap();
+    }
+    println!("FFT Exit");
 }
 
 // some magic which I do not currently understand
@@ -82,6 +96,14 @@ fn power(complex: &Complex<f32>) -> f32 {
 }
 
 fn main() {
+    let matches = App::new("Jack FFT test")
+        .arg(
+            Arg::with_name("sine")
+                .short("s")
+                .long("sine")
+                .required(false),
+        )
+        .get_matches();
     let (client, status) =
         jack::Client::new("microphone_test", jack::ClientOptions::NO_START_SERVER)
             .expect("Couldn't connect to jack");
@@ -94,77 +116,88 @@ fn main() {
         .register_port("speaker", jack::AudioOut::default())
         .expect("Error getting output device");
 
-    let (sender, receiver) = channel();
-    let (fftsender, fftreceiver) = channel();
+    let (sender, receiver) = multiqueue::broadcast_queue(100);
+    let safe_sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
+    let recv_stream = receiver.add_stream();
 
-    // don't know why the sanders are not moved into the closure, this
-    // gets around that they are not. TODO: fix.
-    let safe_sender = Mutex::new(sender);
-    let safe_fftsender = Mutex::new(fftsender);
     let mut pink = twang::Pink::new(None);
-
-    std::thread::spawn(move || {
-        fft(fftreceiver);
+    let mut snds = Sound::new(None, 440.0);
+    let mut sine = matches.is_present("sine");
+    let fft_handle = std::thread::spawn(move || {
+        fft(recv_stream);
+    });
+    let recv_stream = receiver.add_stream();
+    let recv_clone = recv_stream.clone();
+    let record_handle = std::thread::spawn(move || {
+        record(recv_clone);
     });
 
+    let sender_clone = safe_sender.clone();
     let jack_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let out = speaker.as_mut_slice(ps);
         let testvec: Vec<f32> = vec![];
         for v in out.iter_mut() {
-            let val: i16 = pink.next().unwrap().into();
+            let val: i16 = if sine {
+                snds.next().unwrap().sin().into()
+            } else {
+                pink.next().unwrap().into()
+            };
             *v = val as f32;
-            // uncomment below (and comment the corresponding line in the
-            // window function) to log the source pink noise
-            //  (*WRITER.lock().unwrap()).write_sample(val as f32);
         }
-
         let data = jack_mic.as_slice(ps);
-        print!("{} ", data.len());
-
+        let mut u = SAMPLE_COUNT
+            .lock()
+            .unwrap()
+            .load(std::sync::atomic::Ordering::Relaxed);
+        u = u + data.len();
+        *(SAMPLE_COUNT.lock().unwrap()).get_mut() = u;
+        println!(
+            "count is {}",
+            SAMPLE_COUNT
+                .lock()
+                .unwrap()
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
         let d2 = data.to_vec();
-        let d3 = d2.clone();
-        safe_fftsender.lock().unwrap().send(d3).unwrap();
 
-        match safe_sender.lock().unwrap().send(d2) {
+        match sender_clone.lock().unwrap().try_send(Some(d2)) {
             Ok(_) => jack::Control::Continue,
-            Err(_) => jack::Control::Quit,
+            Err(_) => {
+                println!("QUIT, send fgailed");
+                jack::Control::Quit
+            }
         }
     };
 
     let _process = jack::ClosureProcessHandler::new(jack_callback);
     let _active_client = client.activate_async((), _process).unwrap();
-
-    let mut builder = three::Window::builder("A window Imani built");
-    builder.fullscreen(false);
-    let mut win = builder.build();
-    win.scene.background = three::Background::Color(0x000000);
-    let mut state = State {
-        sound_values: Vec::new(),
-        scene_meshes: Vec::new(),
-    };
-
-    let camera = win.factory.orthographic_camera([0.0, 0.0], 1.0, -1.0..1.0);
-    let mut sample_count = 0;
-    while win.update() && !win.input.hit(three::KEY_ESCAPE) {
-        update_lines(&mut win, &mut state);
-        win.render(&camera);
-        remove_lines(&mut win, &mut state);
-
-        while let Ok(audio_buffer) = receiver.try_recv() {
-            sample_count += 1;
-            update_sound_values(&audio_buffer, &mut state);
-            for sample in audio_buffer.iter() {
-                // uncomment this line (and comment the line above in the
-                // callback) to log what the microphone receives
-                (*WRITER.lock().unwrap()).write_sample(*sample);
+    println!("After activate async");
+    let clone = recv_stream.clone();
+    receiver.unsubscribe();
+    while let Ok(received) = clone.recv() {
+        match received {
+            Some(audio_buffer) => {
+                println!("Read {}", audio_buffer.len());
+                if SAMPLE_COUNT
+                    .lock()
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > MAX_SAMPLES
+                {
+                    println!("Stopping");
+                    safe_sender.lock().unwrap().try_send(None);
+                    break;
+                }
             }
-        }
-        if sample_count > 1000 {
-            break;
+            None => break,
         }
     }
     _active_client.deactivate();
-    (*WRITER.lock().unwrap()).flush().unwrap();
+    drop(safe_sender.lock());
+    println!("Waiting for threads to exit");
+    record_handle.join();
+    fft_handle.join();
+    println!("Done");
 }
 
 fn update_sound_values(samples: &[f32], state: &mut State) {
