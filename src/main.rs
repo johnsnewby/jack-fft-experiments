@@ -6,8 +6,7 @@ use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
 use std::io::Write;
-use std::sync::mpsc::*;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use three;
 use twang::Sound;
 
@@ -67,7 +66,10 @@ fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
     }
     println!("Falling falling");
     let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-    let mut input: Vec<Complex<f32>> = samples.iter().map(|val| Complex::new(*val, 0f32)).collect();
+    let mut input: Vec<Complex<f32>> = samples[0..48000]
+        .iter()
+        .map(|val| Complex::new(*val, 0f32))
+        .collect();
     let fft = planner.plan_fft(input.len());
     let mut output: Vec<Complex<f32>> = Vec::new();
     output.resize(input.len(), Zero::zero());
@@ -104,7 +106,7 @@ fn main() {
                 .required(false),
         )
         .get_matches();
-    let (client, status) =
+    let (client, _status) =
         jack::Client::new("microphone_test", jack::ClientOptions::NO_START_SERVER)
             .expect("Couldn't connect to jack");
 
@@ -116,13 +118,17 @@ fn main() {
         .register_port("speaker", jack::AudioOut::default())
         .expect("Error getting output device");
 
+    for port in client.ports(None, None, jack::PortFlags::empty()) {
+        println!("{}", port);
+    }
+
     let (sender, receiver) = multiqueue::broadcast_queue(100);
     let safe_sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
     let recv_stream = receiver.add_stream();
 
     let mut pink = twang::Pink::new(None);
     let mut snds = Sound::new(None, 440.0);
-    let mut sine = matches.is_present("sine");
+    let sine = matches.is_present("sine");
     let fft_handle = std::thread::spawn(move || {
         fft(recv_stream);
     });
@@ -135,7 +141,6 @@ fn main() {
     let sender_clone = safe_sender.clone();
     let jack_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let out = speaker.as_mut_slice(ps);
-        let testvec: Vec<f32> = vec![];
         for v in out.iter_mut() {
             let val: i16 = if sine {
                 snds.next().unwrap().sin().into()
@@ -170,7 +175,26 @@ fn main() {
     };
 
     let _process = jack::ClosureProcessHandler::new(jack_callback);
-    let _active_client = client.activate_async((), _process).unwrap();
+    let active_client = client.activate_async((), _process).unwrap();
+
+    let capture = active_client
+        .as_client()
+        .port_by_name("system:capture_1")
+        .unwrap();
+    let playback = active_client
+        .as_client()
+        .port_by_name("system:playback_1")
+        .unwrap();
+
+    active_client
+        .as_client()
+        .connect_ports_by_name("system:capture_1", "microphone_test:microphone")
+        .unwrap();
+    active_client
+        .as_client()
+        .connect_ports_by_name("microphone_test:speaker", "system:playback_1")
+        .unwrap();
+
     println!("After activate async");
     let clone = recv_stream.clone();
     receiver.unsubscribe();
@@ -185,49 +209,17 @@ fn main() {
                     > MAX_SAMPLES
                 {
                     println!("Stopping");
-                    safe_sender.lock().unwrap().try_send(None);
+                    safe_sender.lock().unwrap().try_send(None).unwrap();
                     break;
                 }
             }
             None => break,
         }
     }
-    _active_client.deactivate();
+    active_client.deactivate().unwrap();
     drop(safe_sender.lock());
     println!("Waiting for threads to exit");
-    record_handle.join();
-    fft_handle.join();
+    record_handle.join().unwrap();
+    fft_handle.join().unwrap();
     println!("Done");
-}
-
-fn update_sound_values(samples: &[f32], state: &mut State) {
-    state.sound_values = samples.to_vec();
-}
-
-fn update_lines(win: &mut three::window::Window, state: &mut State) {
-    for (index, y_position) in state.sound_values.iter().enumerate() {
-        let i = index as f32;
-        let num_samples = state.sound_values.len() as f32;
-        let scale = 3.0;
-        let x_position = (i / (num_samples / scale)) - (0.5 * scale);
-
-        let geometry = three::Geometry::with_vertices(vec![
-            [x_position, y_position.clone(), 0.0].into(),
-            [x_position, -y_position.clone(), 0.0].into(),
-        ]);
-
-        let material = three::material::Line { color: 0xFFFFFF };
-
-        let mesh = win.factory.mesh(geometry, material);
-        win.scene.add(&mesh);
-        state.scene_meshes.push(mesh);
-    }
-}
-
-fn remove_lines(win: &mut three::window::Window, state: &mut State) {
-    for mesh in &state.scene_meshes {
-        win.scene.remove(&mesh);
-    }
-
-    state.scene_meshes.clear();
 }

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+apodize = "1.0.0"
 cgmath = "0.17.0"
 clap = "2.33.0"
 multiqueue = "0.3.2"
