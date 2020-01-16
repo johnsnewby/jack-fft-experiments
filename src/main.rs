@@ -72,10 +72,12 @@ fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
     }
     println!("Falling falling");
     let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-    let mut input: Vec<Complex<f32>> = samples[0..48000]
-        .iter()
-        .map(|val| Complex::new(*val, 0f32))
-        .collect();
+    let window = apodize::hanning_iter(SAMPLE_RATE).collect::<Vec<f64>>();
+    println!(" WIndow length {}", window.len());
+    let mut input: Vec<Complex<f32>> = Vec::with_capacity(SAMPLE_RATE);
+    for i in 0..window.len() {
+        input.push(Complex::new(samples[i] * window[i] as f32, 0f32));
+    }
     let fft = planner.plan_fft(input.len());
     let mut output: Vec<Complex<f32>> = Vec::new();
     output.resize(input.len(), Zero::zero());
@@ -89,8 +91,8 @@ fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
         //                    .as_secs()
     ))
     .unwrap();
-    for ele in output {
-        file.write(format!("{}\n", power(&ele)).as_bytes()).unwrap();
+    for ele in output.iter().map(|x| power(&x)).filter(|x| *x > 0.0) {
+        file.write(format!("{}\n", ele).as_bytes()).unwrap();
     }
     println!("FFT Exit");
 }
