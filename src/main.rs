@@ -21,7 +21,9 @@ lazy_static! {
         Mutex::new(std::sync::atomic::AtomicUsize::new(0));
 }
 
-const MAX_SAMPLES: usize = 240000; // 5s @ 48k
+const SAMPLE_RATE: usize = 48000;
+const MAX_SAMPLES: usize = SAMPLE_RATE * 5;
+const SKIP_SAMPLES: usize = SAMPLE_RATE;
 
 fn record(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
     let mut writer = hound::WavWriter::create(
@@ -34,11 +36,15 @@ fn record(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
         },
     )
     .unwrap();
+    let mut sample_count = 0;
     for samples in receiver {
         match samples {
             Some(x) => {
-                for sample in x {
-                    writer.write_sample(sample).unwrap();
+                sample_count += x.len();
+                if sample_count >= SKIP_SAMPLES {
+                    for sample in x {
+                        writer.write_sample(sample).unwrap();
+                    }
                 }
             }
             None => break,
@@ -110,6 +116,9 @@ fn main() {
         jack::Client::new("microphone_test", jack::ClientOptions::NO_START_SERVER)
             .expect("Couldn't connect to jack");
 
+    let portspec = jack::AudioIn::default();
+    println!("Portspec: {:?}", portspec);
+
     let jack_mic = client
         .register_port("microphone", jack::AudioIn::default())
         .expect("Error getting input device");
@@ -117,10 +126,6 @@ fn main() {
     let mut speaker = client
         .register_port("speaker", jack::AudioOut::default())
         .expect("Error getting output device");
-
-    for port in client.ports(None, None, jack::PortFlags::empty()) {
-        println!("{}", port);
-    }
 
     let (sender, receiver) = multiqueue::broadcast_queue(100);
     let safe_sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
@@ -156,15 +161,8 @@ fn main() {
             .load(std::sync::atomic::Ordering::Relaxed);
         u = u + data.len();
         *(SAMPLE_COUNT.lock().unwrap()).get_mut() = u;
-        println!(
-            "count is {}",
-            SAMPLE_COUNT
-                .lock()
-                .unwrap()
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-        let d2 = data.to_vec();
 
+        let d2 = data.to_vec();
         match sender_clone.lock().unwrap().try_send(Some(d2)) {
             Ok(_) => jack::Control::Continue,
             Err(_) => {
@@ -177,15 +175,6 @@ fn main() {
     let _process = jack::ClosureProcessHandler::new(jack_callback);
     let active_client = client.activate_async((), _process).unwrap();
 
-    let capture = active_client
-        .as_client()
-        .port_by_name("system:capture_1")
-        .unwrap();
-    let playback = active_client
-        .as_client()
-        .port_by_name("system:playback_1")
-        .unwrap();
-
     active_client
         .as_client()
         .connect_ports_by_name("system:capture_1", "microphone_test:microphone")
@@ -193,6 +182,10 @@ fn main() {
     active_client
         .as_client()
         .connect_ports_by_name("microphone_test:speaker", "system:playback_1")
+        .unwrap();
+    active_client
+        .as_client()
+        .connect_ports_by_name("microphone_test:speaker", "system:playback_2")
         .unwrap();
 
     println!("After activate async");
