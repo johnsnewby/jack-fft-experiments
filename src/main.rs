@@ -91,7 +91,7 @@ fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
         //                    .as_secs()
     ))
     .unwrap();
-    for ele in output.iter().map(|x| power(&x)).filter(|x| *x > 0.0) {
+    for ele in output.iter().map(|x| power(&x)) {
         file.write(format!("{}\n", ele).as_bytes()).unwrap();
     }
     println!("FFT Exit");
