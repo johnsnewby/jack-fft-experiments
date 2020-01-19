@@ -7,14 +7,7 @@ use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
 use std::io::Write;
 use std::sync::Mutex;
-use three;
 use twang::Sound;
-
-#[derive(Debug)]
-struct State {
-    sound_values: Vec<f32>,
-    scene_meshes: Vec<three::Mesh>,
-}
 
 lazy_static! {
     static ref SAMPLE_COUNT: Mutex<std::sync::atomic::AtomicUsize> =
