@@ -2,101 +2,33 @@ use clap::{App, Arg};
 use hound;
 #[macro_use]
 extern crate lazy_static;
+use parking_lot::Mutex;
 use rustfft::num_complex::Complex;
 use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
+use std::cell::RefCell;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use twang::Sound;
 
+struct SenderReceiver {
+    pub sender: Sender<f32>,
+    pub receiver: Receiver<f32>,
+}
+
+impl SenderReceiver {
+    pub fn new() -> Self {
+        let (sender, receiver) = channel();
+        Self { sender, receiver }
+    }
+}
+
 lazy_static! {
-    static ref SAMPLE_COUNT: Mutex<std::sync::atomic::AtomicUsize> =
-        Mutex::new(std::sync::atomic::AtomicUsize::new(0));
+    static ref SAMPLE_CHANNEL: Mutex<SenderReceiver> = Mutex::new(SenderReceiver::new());
 }
 
 const SAMPLE_RATE: usize = 48000;
-const MAX_SAMPLES: usize = SAMPLE_RATE * 5;
-const SKIP_SAMPLES: usize = SAMPLE_RATE;
-
-fn record(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
-    let mut writer = hound::WavWriter::create(
-        "test.wav",
-        hound::WavSpec {
-            channels: 1,
-            sample_rate: 48000,
-            bits_per_sample: 32,
-            sample_format: hound::SampleFormat::Float,
-        },
-    )
-    .unwrap();
-    let mut sample_count = 0;
-    for samples in receiver {
-        match samples {
-            Some(x) => {
-                sample_count += x.len();
-                if sample_count >= SKIP_SAMPLES {
-                    for sample in x {
-                        writer.write_sample(sample).unwrap();
-                    }
-                }
-            }
-            None => break,
-        }
-    }
-    println!("Writing WAV");
-    writer.finalize().unwrap();
-    println!("WAV done");
-}
-
-fn fft(receiver: multiqueue::BroadcastReceiver<Option<Vec<f32>>>) {
-    let mut samples: Vec<f32> = vec![];
-    for received in receiver {
-        match received {
-            Some(newsamples) => {
-                println!(
-                    "samples len: {}, newsamples len: {}",
-                    samples.len(),
-                    newsamples.len()
-                );
-                samples.extend(newsamples.iter());
-            }
-            None => break,
-        }
-    }
-    println!("Falling falling");
-    let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-    let window = apodize::hanning_iter(SAMPLE_RATE).collect::<Vec<f64>>();
-    println!(" WIndow length {}", window.len());
-    let mut input: Vec<Complex<f32>> = Vec::with_capacity(SAMPLE_RATE);
-    for i in 0..window.len() {
-        input.push(Complex::new(samples[i] * window[i] as f32, 0f32));
-    }
-    let fft = planner.plan_fft(input.len());
-    let mut output: Vec<Complex<f32>> = Vec::new();
-    output.resize(input.len(), Zero::zero());
-    fft.process(&mut input, &mut output);
-    output.truncate(output.len() / 2);
-    let mut file = std::fs::File::create(format!(
-        "sample.csv",
-        //                std::time::SystemTime::now()
-        //                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        //                    .unwrap()
-        //                    .as_secs()
-    ))
-    .unwrap();
-    for ele in output.iter().map(|x| power(&x)) {
-        file.write(format!("{}\n", ele).as_bytes()).unwrap();
-    }
-    println!("FFT Exit");
-}
-
-// some magic which I do not currently understand
-fn power(complex: &Complex<f32>) -> f32 {
-    20f32
-        * (complex.re * complex.re + complex.im * complex.im)
-            .sqrt()
-            .log10()
-}
 
 fn main() {
     let matches = App::new("Jack FFT test")
@@ -118,45 +50,32 @@ fn main() {
         .register_port("microphone", jack::AudioIn::default())
         .expect("Error getting input device");
 
-    let mut speaker = client
-        .register_port("speaker", jack::AudioOut::default())
+    let mut speaker_l = client
+        .register_port("speaker_l", jack::AudioOut::default())
+        .expect("Error getting output device");
+    let mut speaker_r = client
+        .register_port("speaker_r", jack::AudioOut::default())
         .expect("Error getting output device");
 
     let (sender, receiver) = multiqueue::broadcast_queue(100);
     let safe_sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
     let recv_stream = receiver.add_stream();
 
-    let mut pink = twang::Pink::new(None);
-    let mut snds = Sound::new(None, 440.0);
-    let sine = matches.is_present("sine");
-    let fft_handle = std::thread::spawn(move || {
-        fft(recv_stream);
-    });
-    let recv_stream = receiver.add_stream();
-    let recv_clone = recv_stream.clone();
-    let record_handle = std::thread::spawn(move || {
-        record(recv_clone);
-    });
-
     let sender_clone = safe_sender.clone();
+
     let jack_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
-        let out = speaker.as_mut_slice(ps);
-        for v in out.iter_mut() {
-            let val: i16 = if sine {
-                snds.next().unwrap().sin().into()
-            } else {
-                pink.next().unwrap().into()
-            };
-            *v = val as f32;
+        let out = speaker_l.as_mut_slice(ps);
+        {
+            let receiver = &SAMPLE_CHANNEL.lock().receiver;
+            for v in out.iter_mut() {
+                if let Ok(sample) = receiver.recv() {
+                    *v = sample;
+                } else {
+                    sender_clone.lock().unwrap().try_send(None);
+                }
+            }
         }
         let data = jack_mic.as_slice(ps);
-        let mut u = SAMPLE_COUNT
-            .lock()
-            .unwrap()
-            .load(std::sync::atomic::Ordering::Relaxed);
-        u = u + data.len();
-        *(SAMPLE_COUNT.lock().unwrap()).get_mut() = u;
-
         let d2 = data.to_vec();
         match sender_clone.lock().unwrap().try_send(Some(d2)) {
             Ok(_) => jack::Control::Continue,
@@ -176,12 +95,21 @@ fn main() {
         .unwrap();
     active_client
         .as_client()
-        .connect_ports_by_name("microphone_test:speaker", "system:playback_1")
+        .connect_ports_by_name("microphone_test:speaker_l", "system:playback_1")
         .unwrap();
     active_client
         .as_client()
-        .connect_ports_by_name("microphone_test:speaker", "system:playback_2")
+        .connect_ports_by_name("microphone_test:speaker_r", "system:playback_2")
         .unwrap();
+
+    std::thread::spawn(|| {
+        for sample in hound::WavReader::new(std::io::stdin())
+            .unwrap()
+            .samples::<f32>()
+        {
+            SAMPLE_CHANNEL.lock().sender.send(sample.unwrap() as f32);
+        }
+    });
 
     println!("After activate async");
     let clone = recv_stream.clone();
@@ -190,16 +118,6 @@ fn main() {
         match received {
             Some(audio_buffer) => {
                 println!("Read {}", audio_buffer.len());
-                if SAMPLE_COUNT
-                    .lock()
-                    .unwrap()
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    > MAX_SAMPLES
-                {
-                    println!("Stopping");
-                    safe_sender.lock().unwrap().try_send(None).unwrap();
-                    break;
-                }
             }
             None => break,
         }
@@ -207,7 +125,5 @@ fn main() {
     active_client.deactivate().unwrap();
     drop(safe_sender.lock());
     println!("Waiting for threads to exit");
-    record_handle.join().unwrap();
-    fft_handle.join().unwrap();
     println!("Done");
 }
