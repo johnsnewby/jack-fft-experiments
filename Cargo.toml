@@ -5,13 +5,23 @@ edition = "2018"
 
 [dependencies]
 apodize = "1.0.0"
+bindgen = "0.52.0"
+bounded-spsc-queue = "0.4.0"
 cgmath = "0.17.0"
 clap = "2.33.0"
+crossbeam = "0.2.0"
+crossbeam-channel = "0.4.0"
+crossbeam-queue = "0.2.1"
+crossbeam-utils = "0.7.0"
 multiqueue = "0.3.2"
 hound = "3.4.0"
 jack = "0.6.2"
 lazy_static = "1.4.0"
 mint = "0.5.1"
 parking_lot = "0.10.0"
+queues = "1.1.0"
 rustfft = "3.0.1"
 twang = "0.2.0"
+
+[build-dependencies]
+bindgen = "0.52.0"
