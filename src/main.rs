@@ -1,14 +1,11 @@
 use clap::{App, Arg};
+use crossbeam_channel::unbounded;
 use hound;
-#[macro_use]
-extern crate lazy_static;
-use crossbeam_channel::{unbounded, Receiver, Sender};
-use parking_lot::Mutex;
 
-const SAMPLE_RATE: usize = 48000;
+//const SAMPLE_RATE: usize = 48000;
 
 fn main() {
-    let matches = App::new("Jack FFT test")
+    let _matches = App::new("Jack FFT test")
         .arg(
             Arg::with_name("sine")
                 .short("s")
@@ -23,7 +20,7 @@ fn main() {
     let portspec = jack::AudioIn::default();
     println!("Portspec: {:?}", portspec);
 
-    let jack_mic = client
+    let _jack_mic = client
         .register_port("microphone", jack::AudioIn::default())
         .expect("Error getting input device");
 
@@ -80,12 +77,12 @@ fn main() {
             .unwrap()
             .samples::<f32>()
         {
-            sender.send(sample.unwrap());
+            sender.send(sample.unwrap()).unwrap();
         }
     });
 
     println!("After activate async");
-    wav_reader.join();
+    wav_reader.join().unwrap();
     active_client.deactivate().unwrap();
     println!("Done");
 }
