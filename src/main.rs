@@ -1,8 +1,13 @@
+use crate::sample::Sample;
+
 use clap::{App, Arg};
 use crossbeam_channel::unbounded;
 use hound;
 
-//const SAMPLE_RATE: usize = 48000;
+pub const SAMPLE_RATE: usize = 48000;
+
+mod audio_matcher;
+mod sample;
 
 fn main() {
     let _matches = App::new("Jack FFT test")
@@ -20,7 +25,7 @@ fn main() {
     let portspec = jack::AudioIn::default();
     println!("Portspec: {:?}", portspec);
 
-    let _jack_mic = client
+    let jack_mic = client
         .register_port("microphone", jack::AudioIn::default())
         .expect("Error getting input device");
 
@@ -32,7 +37,10 @@ fn main() {
         .expect("Error getting output device");
 
     let (sender, receiver) = unbounded::<f32>();
-    //let safe_sender = std::sync::Arc::new(std::sync::Mutex::new(sender));
+    let (sample_sender, sample_receiver) = unbounded::<Sample>();
+
+    let mut output_buffer = [0f32; SAMPLE_RATE];
+    let mut out_pos: usize = 0;
 
     let jack_callback = move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
         let out_l = speaker_l.as_mut_slice(ps);
@@ -42,20 +50,21 @@ fn main() {
         for (left, right) in stereo_out {
             *left = receiver.recv().unwrap();
             *right = receiver.recv().unwrap();
+            output_buffer[out_pos] = (*left + *right) / 2.0;
+            out_pos += 1;
+        }
+        sample_sender
+            .send(Sample::Out(output_buffer[..out_pos].to_vec()))
+            .unwrap();
+        out_pos = 0;
+
+        let data = jack_mic.as_slice(ps);
+        if data.len() > 0 {
+            sample_sender.send(Sample::In(data.to_vec())).unwrap();
         }
         jack::Control::Continue
     };
-    /*
-        let data = jack_mic.as_slice(ps);
-        let d2 = data.to_vec();
-        match sender_clone.lock().unwrap().try_send(Some(d2)) {
-            Ok(_) => jack::Control::Continue,
-            Err(_) => {
-                println!("QUIT, send fgailed");
-                jack::Control::Quit
-            }
-        }
-    */
+
     let _process = jack::ClosureProcessHandler::new(jack_callback);
     let active_client = client.activate_async((), _process).unwrap();
 
@@ -71,6 +80,8 @@ fn main() {
         .as_client()
         .connect_ports_by_name("microphone_test:speaker_r", "system:playback_2")
         .unwrap();
+
+    let _matcher_handle = audio_matcher::matcher(sample_receiver);
 
     let wav_reader = std::thread::spawn(move || {
         for sample in hound::WavReader::new(std::io::stdin())
