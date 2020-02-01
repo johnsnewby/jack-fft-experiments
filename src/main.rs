@@ -3,6 +3,7 @@ use crate::sample::Sample;
 use clap::{App, Arg};
 use crossbeam_channel::{bounded, unbounded};
 use hound;
+use itertools::Itertools;
 use rodio;
 use rodio::source::Source;
 extern crate sample as s_ample;
@@ -32,7 +33,7 @@ fn main() {
         .register_port("speaker_r", jack::AudioOut::default())
         .expect("Error getting output device");
 
-    let (sender, receiver) = unbounded::<f32>();
+    let (sender, receiver) = bounded::<f32>(3);
     let (sample_sender, sample_receiver) = unbounded::<Sample>();
 
     let mut output_buffer = [0f32; SAMPLE_RATE];
@@ -93,16 +94,21 @@ fn main() {
             }
             let sample_rate = file.sample_rate();
             let mut source: Box<dyn Iterator<Item = f32>> = Box::new(file.convert_samples());
-            if sample_rate != 48000 {
-                let signal = s_ample::signal::from_interleaved_samples_iter(source);
-                let new_signal = signal.from_hz_to_hz(
-                    s_ample::interpolate::Sinc::new(s_ample::ring_buffer::Fixed::from(
-                        [[0.0]; 100],
-                    )),
-                    sample_rate as f64,
-                    SAMPLE_RATE as f64,
-                );
-                source = Box::new(new_signal.into_interleaved_samples().into_iter());
+            if sample_rate != SAMPLE_RATE as u32 {
+                // Perform conversion if necessary
+                println!("Converting from {}", sample_rate);
+                let signal = s_ample::signal::from_interleaved_samples_iter::<_, [f32; 2]>(source);
+                let mut new_signal = signal
+                    .from_hz_to_hz(
+                        s_ample::interpolate::Sinc::new(s_ample::ring_buffer::Fixed::from(
+                            [[0.0]; 8],
+                        )),
+                        sample_rate as f64,
+                        SAMPLE_RATE as f64,
+                    )
+                    .into_source()
+                    .into_interleaved_samples();
+                source = Box::new(new_signal.into_iter());
             }
             for sample in source {
                 sender.send(sample).unwrap();
