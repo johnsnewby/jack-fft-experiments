@@ -1,8 +1,12 @@
 use crate::sample::Sample;
 
 use clap::{App, Arg};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, unbounded};
 use hound;
+use rodio;
+use rodio::source::Source;
+extern crate sample as s_ample;
+use crate::s_ample::Signal;
 
 pub const SAMPLE_RATE: usize = 48000;
 
@@ -10,14 +14,6 @@ mod audio_matcher;
 mod sample;
 
 fn main() {
-    let _matches = App::new("Jack FFT test")
-        .arg(
-            Arg::with_name("sine")
-                .short("s")
-                .long("sine")
-                .required(false),
-        )
-        .get_matches();
     let (client, _status) =
         jack::Client::new("microphone_test", jack::ClientOptions::NO_START_SERVER)
             .expect("Couldn't connect to jack");
@@ -83,17 +79,39 @@ fn main() {
 
     let _matcher_handle = audio_matcher::matcher(sample_receiver);
 
-    let wav_reader = std::thread::spawn(move || {
-        for sample in hound::WavReader::new(std::io::stdin())
-            .unwrap()
-            .samples::<f32>()
-        {
-            sender.send(sample.unwrap()).unwrap();
+    let file_reader = std::thread::spawn(move || {
+        let mut iter = std::env::args();
+        iter.next().unwrap(); // get rid of argv[0];
+        for filename in iter {
+            let file = rodio::Decoder::new(std::io::BufReader::new(
+                std::fs::File::open(filename).unwrap(),
+            ))
+            .unwrap();
+            if file.channels() != 2 {
+                println!("Only 2 channel supported");
+                continue;
+            }
+            let sample_rate = file.sample_rate();
+            let mut source: Box<dyn Iterator<Item = f32>> = Box::new(file.convert_samples());
+            if sample_rate != 48000 {
+                let signal = s_ample::signal::from_interleaved_samples_iter(source);
+                let new_signal = signal.from_hz_to_hz(
+                    s_ample::interpolate::Sinc::new(s_ample::ring_buffer::Fixed::from(
+                        [[0.0]; 100],
+                    )),
+                    sample_rate as f64,
+                    SAMPLE_RATE as f64,
+                );
+                source = Box::new(new_signal.into_interleaved_samples().into_iter());
+            }
+            for sample in source {
+                sender.send(sample).unwrap();
+            }
         }
     });
 
     println!("After activate async");
-    wav_reader.join().unwrap();
+    file_reader.join().unwrap();
     active_client.deactivate().unwrap();
     println!("Done");
 }
